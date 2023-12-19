@@ -16,10 +16,12 @@ ht_prs_preg
 ├── README.md                       # Overview
 ├── af_dem3.Rmd                     # R markdown code for the main analysis
 ├── af_dem3_080523.html             # html documentation for the main analysis
-├── af_dem3_age.Rmd                 # R markdown code for the age stratified analysis
-├── af_dem3_age_080523.html         # html documentation for the age stratified analysis
-├── af_dem3_sex.Rmd                 # R markdown code for the sex stratified analysis
-├── af_dem3_sex_080523.html         # html documentation for the sex stratified analysis
+├── af_dem3_age.Rmd                 # Age stratified analysis
+├── af_dem3_age_080523.html
+├── af_dem3_sex.Rmd                 # Sex stratified analysis
+├── af_dem3_sex_080523.html
+├── af_dem3_ycutoff.Rmd             # Analysis with one year lag time
+├── af_dem3_ycutoff_150823.html          
 ├── scripts
   ├── functions.R                   # Minor R functions for the analysis
 ├── data
