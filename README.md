@@ -1,8 +1,6 @@
 # af_dem
-Code for the project: 
+Code for the publication: 
 [Kauko, A., et al., Increased risk of dementia differs across cardiovascular diseases and types of dementia - Data from a nationwide study, J. Intern. Med. (2023), Online ahead of print.]()
-
-Miller, E.C., et al., Risk of Midlife Stroke After Adverse Pregnancy Outcomes: The FinnGen Study, Stroke (2023), Online ahead of print.](https://doi.org/10.1111/joim.13733)
 
  We analysed the association between various cardiovascular diseases and the incidence of dementia using FinnGen data.
 
