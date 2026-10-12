@@ -1,0 +1,980 @@
+---
+title: "CVD vs dementia, by sex"
+editor_options:
+  chunk_output_type: console
+  markdown:
+    wrap: sentence
+output:
+  html_document:
+    number_sections: yes
+    code_folding: hide
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    theme: flatly
+    highlight: haddock
+    df_print: paged
+  pdf_document:
+    toc: yes
+---
+
+```{r setup}
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=F)
+
+```
+
+
+<details><summary>**Libraries**</summary>
+
+```{r libraries, class.source = 'fold-show'}
+
+#install.packages("packages/rmarkdown_2.14.tar.gz", repos=NULL)
+
+library(tidyverse)
+library(survival)   # survival analysis
+library(data.table) # fread() function
+library(gridExtra)  # plots to grid
+library(survminer)  # ggbased visualization and extra diagnostics
+library(visdat)     # visualization of tibble and na's
+library(kableExtra) # Pretty tables
+library(tableone)   # Characteristics table
+library(forestplot) # forestplot
+
+fg_pheno_path <- "/finngen/library-red/finngen_R9/phenotype_1.0/data"
+data_path <- "data"
+fig_path <- "figs2"
+#font_size <- 12
+
+source("scripts/functions.R")
+
+```
+
+</details>
+
+<br>
+
+# Data
+
+<br>
+
+## Definitions
+
+This is sex stratified version of the analysis.
+
+
+**Outcomes**
+
+* Any dementia (KRA_PSY_DEMENTIA)
+* Alzheimer disease (G6_ALZHEIMER)
+* Vascular dementia (F5_VASCDEM)
+
+**Exposures**
+
+* Heart failure (I9_HEARTFAIL_ALLCAUSE)
+* Atrial fibrillation (I9_AF)
+* Myocardial infarction (I9_MI)
+* Peripheral arterial disease (I9_PAD)
+* Stroke (I9_STR)
+* TIA (I9_TIA)
+
+**Covariates**
+
+Age is not included as we do not have explicit baseline.  
+Dementia age is taken account by using age as time scale.
+Birth year is included to take account cohort effects.
+Disease covariates are treated as time varied covariates.
+
+* Birth year, (SD)
+* Smoking, n (%)
+
+Disease covariates
+
+* Obesity (E4_OBESITY), n (%)
+* Hyperlipidemia (E4_HYPERLIPMIX|RX_STATIN), n (%)
+* Chronic kidney disease (N14_CHRONKIDNEYDIS), n (%)
+* Hypertension (I9_HYPERTENSION), n (%)
+* Diabetes (E4_DIABETES), n (%)
+* Alcohol abuse (AUD), n (%)
+
+
+
+## Variable lists
+
+```{r}
+
+nicenames <- c(DEMENTIA = "Any dementia", ALZHEIMER = "Alzheimer disase", VASCDEM = "Vascular dementia", 
+               AF_TDC = "Atrial fibrillation", OBESITY_TDC = "Obesity", 
+               HYPLIP_WIDE_TDC = "Hyperlipidemia", HEARTFAIL_ALLCAUSE_TDC="Heart failure", 
+               MI_TDC = "Myocardial infarction", CHRONKIDNEYDIS_TDC = "Chronic kidney disease", 
+               HYPERTENSION_TDC = "Hypertension", DIABETES_TDC = "Diabetes", STR_TDC = "Stroke",
+               STR_EMBOLIC_TDC = "Embolic stroke", TIA_TDC = "TIA", 
+               AUD_TDC = "Alcohol abuse", PAD_TDC = "PAD")
+
+#Outcomes
+names_ep <- list("DEMENTIA", "ALZHEIMER", "VASCDEM")
+ep_age <-   str_replace(unlist(names_ep), "(.*)", "\\1_AGE")
+
+#time dependent variables
+tdc_vars <- c("AF_TDC","OBESITY_TDC", "HYPLIP_WIDE_TDC", "HEARTFAIL_ALLCAUSE_TDC", "MI_TDC", 
+             "CHRONKIDNEYDIS_TDC", "HYPERTENSION_TDC", "DIABETES_TDC", "STR_TDC", 
+             "TIA_TDC", "AUD_TDC", "PAD_TDC")
+tdc_vars_ever <- str_remove(tdc_vars, "_TDC")
+tdc_vars_age <- str_replace(tdc_vars, "_TDC", "_AGE")
+tdc_vars2 <- c("HEARTFAIL_ALLCAUSE_TDC", "AF_TDC", "MI_TDC", "PAD_TDC", "STR_TDC" , "TIA_TDC")
+
+
+#Other covariates
+oth_covs <- c("BIRTH_YEAR", "SMOKED")   
+oth_covs2 <- c(oth_covs, "OBESITY_TDC",  "HYPLIP_WIDE_TDC", "CHRONKIDNEYDIS_TDC", "HYPERTENSION_TDC", "DIABETES_TDC", "AUD_TDC")
+
+
+#Study start year
+start_year = 1998
+
+```
+
+
+
+## Preselect phenotype columns
+
+Entries of interest from endpoint file are preselected at 'rather big machine', because the original phenotype file is very large.
+
+```{r, eval=F}
+
+pheno_cols <- fread("data/variables.txt") %>%
+  mutate(col_age = str_glue("{column}_AGE")) %>%
+  mutate(col_year = str_glue("{column}_YEAR"))
+
+pheno_cols_all <- c(pheno_cols$column, pheno_cols$col_age, pheno_cols$col_year) 
+
+pheno_tmp <- fread(str_glue("{fg_pheno_path}/finngen_R9_endpoint_1.0.txt.gz")) %>%  
+  select(FINNGENID, FU_END_AGE, all_of(pheno_cols_all))
+
+fwrite(pheno_tmp, 'data/finngen_R9_myvars.tsv.gz', sep='\t')
+
+```
+
+
+## Read in and preprocess
+
+
+```{r}
+
+#disease variables
+phenotypes <- fread("data/finngen_R9_myvars.tsv.gz") %>%
+
+  #Names are simplified
+  rename_at(vars(matches("^[A-Z][0-9]+_")), list(~str_remove(., "^[A-Z][0-9]+_"))) %>%
+  rename_at(vars(starts_with('KRA_PSY_')), list(~str_remove(., "KRA_PSY_"))) %>%
+  rename_at(vars(starts_with('C_')), list(~str_remove(., "C_"))) %>%
+  rename_at(vars(starts_with('DM_')), list(~str_remove(., "DM_"))) %>%
+  rename_at(vars(starts_with('RX_')), list(~str_remove(., "RX_"))) %>%
+  
+  #Wider definition of hypercholesterolaemia, includes also statin medication
+  mutate(HYPLIP_WIDE = if_else(HYPERLIPMIX == 1 | STATIN == 1, 1L, 0L)) %>%
+  rowwise() %>%
+    mutate(HYPLIP_WIDE_AGE = min(HYPERLIPMIX_AGE, STATIN_AGE)) %>%
+  ungroup() %>%
+  
+  #Change NA -> 0 for disease variables
+  #FinnGen data is constructed for GWASes, where similar diseases need to be removed from controls
+  #This does not apply to present study
+   mutate_at(c(unlist(names_ep), tdc_vars_ever), ~if_else(is.na(.), 0L, .))
+
+
+#other covariates
+phenomin <- fread(str_glue("{fg_pheno_path}/finngen_R9_minimum_1.0.txt.gz")) %>%
+  select("FINNGENID", contains("BL_"), "SEX", "SMOKE3", "SMOKE_AGE", "movedabroad") %>%
+  #smoking: ever-never according phenotype minimal file
+  mutate(SMOKED = if_else(SMOKE3 == "never", 0, 1)) %>%
+  #Approximate birth year calculated from BL_YEAR and BL_AGE
+  mutate(BIRTH_YEAR = BL_YEAR - BL_AGE,     #genotyping year and age
+         START_AGE = if_else(floor(BIRTH_YEAR) < start_year, start_year-BIRTH_YEAR, 0),
+         BIRTH_YEAR = as.integer(floor(BIRTH_YEAR)))
+
+#Imputed sex is from genotyped dataset
+sex_in <- fread(str_glue("/finngen/library-red/finngen_R9/analysis_covariates/R9_COV_V1.FID.txt.gz")) %>%
+  select(IID, SEX_IMPUTED) %>%
+  rename(FINNGENID = IID) %>%
+  rename(WOMEN = SEX_IMPUTED)
+
+```
+
+
+## Combine & filter
+
+**All**
+
+```{r}
+df.tmp1 <-phenomin %>%
+  right_join(sex_in, by = "FINNGENID") %>%   #This represent official genotyped dataset
+  left_join(phenotypes, by = "FINNGENID")
+df.tmp1 %>% select("WOMEN") %>% mutate_all(as.factor) %>% summary
+
+
+```
+
+**Remove individual with no "FU_END_AGE" i.e. individuals missing from endpoint-file**
+
+```{r}
+#Remove individual with no "FU_END_AGE" i.e. individuals missing from endpoint-file
+df.tmp2 <- df.tmp1 %>%
+  filter(!is.na(FU_END_AGE))
+df.tmp2 %>% select("WOMEN") %>% mutate_all(as.factor) %>% summary
+
+```
+
+
+**Remove if no smoking record**
+```{r}
+#Remove individual if no smoking record
+df.tmp3 <- df.tmp2 %>%
+  filter(!is.na(SMOKED))
+df.tmp3 %>% select("WOMEN") %>% mutate_all(as.factor) %>% summary
+
+```
+
+
+**Remove if any dementia before 'start year' 1988**
+
+Full register coverage starts from this year.
+
+```{r}
+#Remove individual if any dementia before 'start year'
+df <- df.tmp3 %>%
+  filter(DEMENTIA_AGE > START_AGE+0.003 & ALZHEIMER_AGE > START_AGE+0.003 & VASCDEM_AGE > START_AGE+0.003)
+  #0.003 years = one day; coxph would inteprete very short time difference 0 time followup
+df %>% select("WOMEN") %>% mutate_all(as.factor) %>% summary
+
+```
+
+
+
+## Variables to list by outcome
+
+Minor formatting
+
+```{r}
+
+#Minor formatting for more clear summaries etc
+df <- df %>%
+  mutate_at(unlist(names_ep), ~as.integer(as.character(.)) ) %>%
+  mutate_at(c(tdc_vars_ever), as.factor) %>%
+  select(FINNGENID, WOMEN, all_of(oth_covs), FU_END_AGE, START_AGE, BIRTH_YEAR, all_of(unlist(names_ep)), all_of(ep_age),
+         all_of(tdc_vars_ever), all_of(tdc_vars_age))
+
+```
+
+
+**As time varied variable**
+
+All
+
+```{r}
+
+df.list.tdc <- lapply(names_ep, as.null) %>% setNames(names_ep)
+
+for(ep in unlist(names_ep)){
+  
+  #ep = "DEMENTIA"
+  ep_age_tmp <- as.character(str_glue("{ep}_AGE"))
+  dfi <- df  #%>% slice(1:30)
+  #print(ep)
+
+  dfi.tmp   <- tmerge(data1=dfi,   data2=dfi, id=FINNGENID, tstart = START_AGE, tstop = get(ep_age_tmp),
+                      event=event(get(ep_age_tmp), get(ep)))
+  
+  for(var in tdc_vars_ever){
+    #var %>% print()
+    dfi.tmp  <- tmerge(data1=dfi.tmp, data2=dfi, id=FINNGENID, tdc_var = tdc(get(str_glue("{var}_AGE")))) %>%
+      rename(!!str_glue("{var}_TDC") := tdc_var)
+  }
+  
+  df.list.tdc[[ep]] <- dfi.tmp %>%
+    filter(tstop > tstart+0.003) %>%  #0.003 years = one day; coxph would inteprete very short time difference 0 time followup
+    mutate(time_test = tstop - tstart)
+}
+
+```
+
+Women
+
+```{r}
+
+df.list.tdc.f <- lapply(df.list.tdc, function(dfi) {dfi %>% filter(WOMEN==1)}) 
+
+```
+
+Men
+
+```{r}
+
+df.list.tdc.m <- lapply(df.list.tdc, function(dfi) {dfi %>% filter(WOMEN==0)}) 
+
+```
+
+
+
+## Characteristics{.tabset}
+
+Separate tables are generated for different outcomes, because filtering of prevalents and setting disease covariates as 'prior' are done separately for each outcome.
+
+
+### Dementia
+
+```{r}
+
+ep <- "DEMENTIA"
+vars <- c(ep,  "END_AGE", oth_covs, tdc_vars)
+fact_vars <- c(ep, "SMOKED", tdc_vars)
+
+#Women
+df.tmp <- df.list.tdc.f[[ep]] %>% 
+  select(FINNGENID, all_of(c(ep, str_glue("{ep}_AGE"), oth_covs, tdc_vars))) %>% 
+  group_by(FINNGENID) %>%
+  summarise_all(max) %>%   #For 'tdc variables'  we want maximum (1 if any of the rows have 1), others should be the same in all rows an individual.
+  rename(END_AGE = str_glue("{ep}_AGE"))
+
+table.f <- CreateTableOne(vars=vars, data=df.tmp, factorVars = fact_vars, test=F) %>%
+  print(dropEqual=T, printToggle=F, contDigits=1) 
+colnames(table.f) <- c("Women")
+
+
+#Men
+df.tmp <- df.list.tdc.m[[ep]] %>% 
+  select(FINNGENID, all_of(c(ep, str_glue("{ep}_AGE"), oth_covs, tdc_vars))) %>% 
+  group_by(FINNGENID) %>%
+  summarise_all(max) %>%   #For 'tdc variables'  we want maximum (1 if any of the rows have 1), others should be the same in all rows an individual.
+  rename(END_AGE = str_glue("{ep}_AGE"))
+
+table.m <- CreateTableOne(vars=vars, data=df.tmp, factorVars = fact_vars, test=F) %>%
+  print(dropEqual=T, printToggle=F, contDigits=1) 
+colnames(table.m) <- c("Men")
+
+
+#Combine
+cbind(table.f, table.m) %>%
+  my.kable
+
+
+```
+
+
+### Alzheimer
+
+**Women**
+
+```{r}
+
+ep <- "ALZHEIMER"
+vars <- c(ep,  "END_AGE", oth_covs, tdc_vars)
+fact_vars <- c(ep, "SMOKED", tdc_vars)
+
+#Women
+df.tmp <- df.list.tdc.f[[ep]] %>% 
+  select(FINNGENID, all_of(c(ep, str_glue("{ep}_AGE"), oth_covs, tdc_vars))) %>% 
+  group_by(FINNGENID) %>%
+  summarise_all(max) %>%   #For 'tdc variables'  we want maximum (1 if any of the rows have 1), others should be the same in all rows an individual.
+  rename(END_AGE = str_glue("{ep}_AGE"))
+
+table.f <- CreateTableOne(vars=vars, data=df.tmp, factorVars = fact_vars, test=F) %>%
+  print(dropEqual=T, printToggle=F, contDigits=1) 
+colnames(table.f) <- c("Women")
+
+
+#Men
+df.tmp <- df.list.tdc.m[[ep]] %>% 
+  select(FINNGENID, all_of(c(ep, str_glue("{ep}_AGE"), oth_covs, tdc_vars))) %>% 
+  group_by(FINNGENID) %>%
+  summarise_all(max) %>%   #For 'tdc variables'  we want maximum (1 if any of the rows have 1), others should be the same in all rows an individual.
+  rename(END_AGE = str_glue("{ep}_AGE"))
+
+table.m <- CreateTableOne(vars=vars, data=df.tmp, factorVars = fact_vars, test=F) %>%
+  print(dropEqual=T, printToggle=F, contDigits=1) 
+colnames(table.m) <- c("Men")
+
+
+#Combine
+cbind(table.f, table.m) %>%
+  my.kable
+
+
+```
+
+
+
+### Vascular dementia
+
+```{r}
+
+ep <- "VASCDEM"
+vars <- c(ep,  "END_AGE", oth_covs, tdc_vars)
+fact_vars <- c(ep, "SMOKED", tdc_vars)
+
+#Women
+df.tmp <- df.list.tdc.f[[ep]] %>% 
+  select(FINNGENID, all_of(c(ep, str_glue("{ep}_AGE"), oth_covs, tdc_vars))) %>% 
+  group_by(FINNGENID) %>%
+  summarise_all(max) %>%   #For 'tdc variables'  we want maximum (1 if any of the rows have 1), others should be the same in all rows an individual.
+  rename(END_AGE = str_glue("{ep}_AGE"))
+
+table.f <- CreateTableOne(vars=vars, data=df.tmp, factorVars = fact_vars, test=F) %>%
+  print(dropEqual=T, printToggle=F, contDigits=1) 
+colnames(table.f) <- c("Women")
+
+
+#Men
+df.tmp <- df.list.tdc.m[[ep]] %>% 
+  select(FINNGENID, all_of(c(ep, str_glue("{ep}_AGE"), oth_covs, tdc_vars))) %>% 
+  group_by(FINNGENID) %>%
+  summarise_all(max) %>%   #For 'tdc variables'  we want maximum (1 if any of the rows have 1), others should be the same in all rows an individual.
+  rename(END_AGE = str_glue("{ep}_AGE"))
+
+table.m <- CreateTableOne(vars=vars, data=df.tmp, factorVars = fact_vars, test=F) %>%
+  print(dropEqual=T, printToggle=F, contDigits=1) 
+colnames(table.m) <- c("Men")
+
+
+#Combine
+cbind(table.f, table.m) %>%
+  my.kable
+
+
+```
+
+
+### {-}
+
+# Analysis
+
+## Kaplan Meier
+
+### Models
+
+Let's see raw data and examine proportional hazard assumption
+
+Surv(tstart, tstop, event) ~ {var_tdc} + WOMEN)
+
+```{r}
+
+ep="DEMENTIA"
+
+km.l.d <-
+  lapply(as.list(tdc_vars), function(var){
+    
+    my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var} + WOMEN")
+    survfit(as.formula(my_formula), data=df.list.tdc[[ep]])
+
+  }) %>% setNames(tdc_vars)
+
+
+ep <-  "ALZHEIMER"
+
+km.l.a <-
+  lapply(as.list(tdc_vars), function(var){
+    
+    my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var} + WOMEN")
+    survfit(as.formula(my_formula), data=df.list.tdc[[ep]])
+
+  }) %>% setNames(tdc_vars)
+
+
+ep <- "VASCDEM"
+
+km.l.v <-
+  lapply(as.list(tdc_vars), function(var){
+    
+    my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var} + WOMEN")
+    survfit(as.formula(my_formula), data=df.list.tdc[[ep]])
+
+  }) %>% setNames(tdc_vars)
+
+
+```
+
+
+### Kaplan Meier summary figure
+
+```{r, fig.width=12, fig.height=8}
+
+nicenames <- c(DEMENTIA = "Any dementia", ALZHEIMER = "Alzheimer disase", VASCDEM = "Vascular dementia", 
+               AF_TDC = "Atrial\nfibrillation", OBESITY_TDC = "Obesity", 
+               HYPLIP_WIDE_TDC = "Hyperlipidemia", HEARTFAIL_ALLCAUSE_TDC="Heart\nfailure", 
+               MI_TDC = "Myocardial\ninfarction", CHRONKIDNEYDIS_TDC = "Chronic kidney disease", 
+               HYPERTENSION_TDC = "Hypertension", DIABETES_TDC = "Diabetes", STR_TDC = "Stroke",
+               STR_EMBOLIC_TDC = "Embolic stroke", TIA_TDC = "TIA", 
+               AUD_TDC = "Alcohol abuse", PAD_TDC = "PAD")
+fontsize <- 13
+palette <- c("#92C5DE","#F4A582","#0571B0","#CA0020")
+legend.labs <- c("Men: No exposure","Women: No exposure", "Men: Exposed", "Women: Exposed")
+
+#Exposure labels
+exp.labs.l <- lapply(as.list(tdc_vars2), function(var){
+  text_grob(nicenames[var], just="left", size=fontsize)
+})
+p0 <- arrangeGrob(grobs=exp.labs.l, ncol=1)
+
+#Dementia
+ep="DEMENTIA" 
+var="AF_TDC"  #Without initialization loop fails, which is strange
+my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var}")
+
+plots.kms <-   lapply(as.list(tdc_vars2), function(var){
+  
+  my.km <-  
+    ggsurvplot(km.l.d[[var]], fun="event", conf.int=F, censor=F, 
+       xlim=c(60,95), ylim=c(0,0.82), break.x.by=5, break.y.by=0.2,
+       title = "", xlab = "", legend="none", legend.labs=legend.labs,
+       ggtheme = theme_classic(), palette = palette, size = 0.5)$plot
+}) %>% setNames(as.list(tdc_vars2))
+#xlab only to bottom row (TIA)
+plots.kms$TIA_TDC <- plots.kms$TIA_TDC +
+  xlab("Age, years")
+
+p1 <- arrangeGrob(grobs=plots.kms, ncol=1, top=text_grob("Any dementia", size=fontsize))
+
+
+#Alzheimer
+ep="ALZHEIMER" 
+var="AF_TDC"  #Without initialization loop fails, which is strange
+my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var}")
+
+plots.kms <-   lapply(as.list(tdc_vars2), function(var){
+  
+  my.km <-  
+    ggsurvplot(km.l.a[[var]], fun="event", conf.int=F, censor=F, 
+       xlim=c(60,95), ylim=c(0,0.82), break.x.by=5, break.y.by=0.2,
+       title = "", xlab = "", legend="none", legend.labs=legend.labs,
+       ggtheme = theme_classic(), palette = palette, size = 0.5)$plot
+}) %>% setNames(as.list(tdc_vars2))
+#xlab only to bottom row (TIA)
+plots.kms$TIA_TDC <- plots.kms$TIA_TDC +
+  xlab("Age, years")
+
+p2 <- arrangeGrob(grobs=plots.kms, ncol=1, top=text_grob("Alzheimer's disease", size=fontsize))
+
+
+
+#Vascular dementia
+ep="VASCDEM" 
+var="AF_TDC"  #Without initialization loop fails, which is strange
+my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var}")
+
+plots.kms <-   lapply(as.list(tdc_vars2), function(var){
+  
+  my.km <-  
+    ggsurvplot(km.l.v[[var]], fun="event", conf.int=F, censor=F, 
+       xlim=c(60,95), ylim=c(0,0.82), break.x.by=5, break.y.by=0.2,
+       title = "", xlab = "", legend="none", legend.labs=legend.labs,
+       ggtheme = theme_classic(), palette = palette, size = 0.5)$plot
+}) %>% setNames(as.list(tdc_vars2))
+#xlab only to bottom row (TIA)
+plots.kms$TIA_TDC <- plots.kms$TIA_TDC +
+  xlab("Age, years")
+
+#Legends fixed
+plots.kms$HEARTFAIL_ALLCAUSE_TDC <- 
+  plots.kms$HEARTFAIL_ALLCAUSE_TDC +
+  theme(legend.position = c(0.5,0.78)) +   #Inserted image
+  guides(col = guide_legend(reverse = TRUE), fill = guide_legend(reverse = TRUE)) + #Reverse order
+  theme(legend.title=element_blank()) 
+
+p3 <- arrangeGrob(grobs=plots.kms, ncol=1, top=text_grob("Vascular dementia", size=fontsize))
+
+#Combine all
+p.grid <- arrangeGrob(p0, p1,p2,p3, ncol=4)
+
+
+ggsave(file = str_glue("{fig_path}/km.grid.sex.png"), plot = p.grid, height = 14, width = 10, dpi = 300)
+ggsave(file = str_glue("{fig_path}/km.grid.sex.eps"), plot = p.grid, device = cairo_ps, height = 14, width =10, dpi = 300)
+
+```
+
+<img src="figs2/km.grid.sex.png"/>
+
+
+<details><summary>**loglog curves**</summary>
+
+
+```{r, fig.width=12, fig.height=8}
+
+nicenames <- c(DEMENTIA = "Any dementia", ALZHEIMER = "Alzheimer disase", VASCDEM = "Vascular dementia", 
+               AF_TDC = "Atrial\nfibrillation", OBESITY_TDC = "Obesity", 
+               HYPLIP_WIDE_TDC = "Hyperlipidemia", HEARTFAIL_ALLCAUSE_TDC="Heart\nfailure", 
+               MI_TDC = "Myocardial\ninfarction", CHRONKIDNEYDIS_TDC = "Chronic kidney disease", 
+               HYPERTENSION_TDC = "Hypertension", DIABETES_TDC = "Diabetes", STR_TDC = "Stroke",
+               STR_EMBOLIC_TDC = "Embolic stroke", TIA_TDC = "TIA", 
+               AUD_TDC = "Alcohol abuse", PAD_TDC = "PAD")
+fontsize <- 13
+palette <- c("#92C5DE","#F4A582","#0571B0","#CA0020")
+legend.labs <- c("Men: No exposure","Women: No exposure", "Men: Exposed", "Women: Exposed")
+
+#Exposure labels
+exp.labs.l <- lapply(as.list(tdc_vars2), function(var){
+  text_grob(nicenames[var], just="left", size=fontsize)
+})
+p0 <- arrangeGrob(grobs=exp.labs.l, ncol=1)
+
+#Dementia
+ep="DEMENTIA" 
+var="AF_TDC"  #Without initialization loop fails, which is strange
+my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var}")
+
+plots.kms <-   lapply(as.list(tdc_vars2), function(var){
+  
+  my.km <-  
+    ggsurvplot(km.l.d[[var]], fun="cloglog", conf.int=F, censor=F, 
+       xlim=c(65,95), break.x.by=5, 
+       title = "", xlab = "", legend="none", legend.labs=legend.labs,
+       ggtheme = theme_classic(), palette = palette, size = 0.5)$plot
+}) %>% setNames(as.list(tdc_vars2))
+#xlab only to bottom row (TIA)
+plots.kms$TIA_TDC <- plots.kms$TIA_TDC +
+  xlab("Age, years")
+
+p1 <- arrangeGrob(grobs=plots.kms, ncol=1, top=text_grob("Any dementia", size=fontsize))
+
+
+#Alzheimer
+ep="ALZHEIMER" 
+var="AF_TDC"  #Without initialization loop fails, which is strange
+my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var}")
+
+plots.kms <-   lapply(as.list(tdc_vars2), function(var){
+  
+  my.km <-  
+    ggsurvplot(km.l.a[[var]], fun="cloglog", conf.int=F, censor=F, 
+       xlim=c(65,95), break.x.by=5, 
+       title = "", xlab = "", legend="none", legend.labs=legend.labs,
+       ggtheme = theme_classic(), palette = palette, size = 0.5)$plot
+}) %>% setNames(as.list(tdc_vars2))
+#xlab only to bottom row (TIA)
+plots.kms$TIA_TDC <- plots.kms$TIA_TDC +
+  xlab("Age, years")
+
+p2 <- arrangeGrob(grobs=plots.kms, ncol=1, top=text_grob("Alzheimer's disease", size=fontsize))
+
+
+
+#Vascular dementia
+ep="VASCDEM" 
+var="AF_TDC"  #Without initialization loop fails, which is strange
+my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var}")
+
+plots.kms <-   lapply(as.list(tdc_vars2), function(var){
+  
+  my.km <-  
+    ggsurvplot(km.l.v[[var]], fun="cloglog", conf.int=F, censor=F, 
+       xlim=c(65,95),  break.x.by=5,
+       title = "", xlab = "", legend="none", legend.labs=legend.labs,
+       ggtheme = theme_classic(), palette = palette, size = 0.5)$plot
+}) %>% setNames(as.list(tdc_vars2))
+#xlab only to bottom row (TIA)
+plots.kms$TIA_TDC <- plots.kms$TIA_TDC +
+  xlab("Age, years")
+
+p3 <- arrangeGrob(grobs=plots.kms, ncol=1, top=text_grob("Vascular dementia", size=fontsize))
+
+#Combine all
+p.grid <- arrangeGrob(p0, p1,p2,p3, ncol=4)
+
+
+ggsave(file = str_glue("{fig_path}/log.grid.sex.png"), plot = p.grid, height = 14, width = 10, dpi = 300)
+ggsave(file = str_glue("{fig_path}/log.grid.sex.eps"), plot = p.grid, device = cairo_ps, height = 14, width =10, dpi = 300)
+
+```
+
+<img src="figs2/log.grid.sex.png"/>
+
+
+</details>
+
+
+
+### {-}
+
+## Cox models{.tabset}
+
+**Models**
+
+Surv(tstart, tstop, event) ~ {var} + {oth_covs2} 
+Interaction: Surv(tstart, tstop, event) ~ {var}*WOMEN + {oth_covs2} 
+
+
+```{r}
+
+
+nicenames <- c(DEMENTIA = " Any dementia", ALZHEIMER = " Alzheimer disase", VASCDEM = " Vascular dementia", 
+               AF_TDC = " Atrial fibrillation", OBESITY_TDC = " Obesity", 
+               HYPLIP_WIDE_TDC = " Hyperlipidemia", HEARTFAIL_ALLCAUSE_TDC=" Heart failure", 
+               MI_TDC = " Myocardial infarction", CHRONKIDNEYDIS_TDC = " Chronic kidney disease", 
+               HYPERTENSION_TDC = " Hypertension", DIABETES_TDC = " Diabetes", STR_TDC = " Stroke",
+               STR_EMBOLIC_TDC = " Embolic stroke", TIA_TDC = " TIA", 
+               AUD_TDC = " Alcohol abuse", PAD_TDC = " PAD")
+
+#Initialize
+ep <-  "DEMENTIA"
+cx.table.l <- lapply(names_ep, function(x){NULL}) %>% setNames(unlist(names_ep))
+#cx.full.l  <- lapply(names_ep, function(x){NULL}) %>% setNames(unlist(names_ep))
+
+#For each outcome...
+for(ep in unlist(names_ep)){
+  
+  #Covariate vector to formula format  
+  oth_covs2_f <- paste(c(oth_covs2), collapse = " + ")
+
+  #Models
+  cx.l.tdc.f<-
+    lapply(as.list(tdc_vars2), function(var){
+      
+      my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var} + {oth_covs2_f}")
+      coxph(as.formula(my_formula), data=df.list.tdc.f[[ep]])
+  
+   }) %>% setNames(tdc_vars2)
+  
+   cx.l.tdc.m<-
+    lapply(as.list(tdc_vars2), function(var){
+      
+      my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var} + {oth_covs2_f}")
+      coxph(as.formula(my_formula), data=df.list.tdc.m[[ep]])
+  
+    }) %>% setNames(tdc_vars2)
+  
+   cx.l.tdc.i<-
+    lapply(as.list(tdc_vars2), function(var){
+      
+      my_formula <- str_glue("Surv(tstart, tstop, event) ~ {var}*WOMEN + {oth_covs2_f}")
+      coxph(as.formula(my_formula), data=df.list.tdc[[ep]])
+  
+    }) %>% setNames(tdc_vars2)
+      
+   
+  #Number of exposed
+  nN.f <- df.list.tdc.f[[ep]] %>% extract_nN_tdc(ep, tdc_vars2) 
+  nN.m <- df.list.tdc.m[[ep]] %>% extract_nN_tdc(ep, tdc_vars2)   
+   
+  #Tables
+  tmp.table.f <-  lapply(tdc_vars2, function(var){
+    coefs <- cx.l.tdc.f[[var]] %>% 
+      my_extr_coef(ep, var)
+  }) %>% setNames(tdc_vars2) %>%
+    reduce(bind_rows) %>%
+    mutate(Sex="Women") %>%
+    left_join(nN.f, by="names")
+  
+ tmp.table.m <-  lapply(tdc_vars2, function(var){
+    coefs <- cx.l.tdc.m[[var]] %>% 
+      my_extr_coef(ep, var)
+  }) %>% setNames(tdc_vars2) %>%
+    reduce(bind_rows)%>%
+    mutate(Sex="Men")%>%
+    left_join(nN.m, by="names")
+ 
+  tmp.table.i <-  lapply(tdc_vars2, function(var){
+    coefs <- cx.l.tdc.i[[var]] %>% 
+      my_extr_coef(ep, ":")
+  }) %>% setNames(tdc_vars2) %>%
+    reduce(bind_rows) %>%
+    #mutate(p.adj = p.adjust(pval, method = "fdr", n = 18)) %>%
+    mutate(names=str_replace(names,"^(.*):.*","\\1")) %>%
+    select(names, pval)
+  
+  #Everything colelcted 
+  cx.table.l[[ep]] <- bind_rows(tmp.table.f,tmp.table.m) %>%
+    select(-pval) %>%
+    left_join(tmp.table.i, by="names") %>%
+    select(name, names, est, lower, upper, pval, nN_exp, nN_nexp, Sex) %>%
+    my_tidy_est() %>%
+    rename(outcome=name, variable=names, mean=est) %>%
+    mutate(variable=nicenames[variable]) 
+   
+}
+
+
+```
+
+### Dementia
+
+```{r,  message=F, results=F}
+
+ep = "DEMENTIA"
+
+#Hack to deal with separate values
+tmp <- cx.table.l[[ep]] %>%
+  select(variable, Sex, est_ci, nN_exp) %>%
+  pivot_wider(names_from=Sex, values_from=c("est_ci", "nN_exp")) %>%
+  unite(est_ci, matches("est_ci"), sep="\n")  %>%
+  unite(nN_exp, matches("nN"), sep="\n")
+  
+cx.table <- cx.table.l[[ep]] %>%
+  select(outcome, variable, mean, lower, upper, pval, Sex) %>%
+  left_join(tmp, by="variable") 
+
+#Forestplot&Table
+font.s <- 1.3
+font.l <- 1.5
+lwd.bar <- 3
+
+forest <- cx.table %>%
+  group_by(Sex) %>%
+  forestplot(labeltext = c(variable, nN_exp, est_ci, pval),
+             legend_args = fpLegend(pos = list(x = .8, y = 0.79), 
+                                    gp = gpar(col = "#CCCCCC")),
+             fn.ci_norm = c(fpDrawCircleCI, fpDrawNormalCI),
+             #boxsize = .1, # We set the box size to better visualize the type
+             line.margin = .3, # We need to add this to avoid crowding
+             graph.pos=3,
+             xlog=T,
+             shapes_gp = fpShapesGp(default = gpar(lwd = lwd.bar)),
+             txt_gp = fpTxtGp(ticks = gpar(cex=font.s-.1), 
+                              label=list(gpar(cex=font.l), gpar(cex=font.s), gpar(cex=font.s), gpar(cex=font.l)),
+                              legend=gpar(cex=font.s), 
+                              summary = gpar(cex=font.l))
+             ) %>%
+  fp_add_header(variable= " Variable\n", nN_exp="Exposed\nn/N", est_ci = "HR (95% CI)\n", pval = "Interaction\nP-value") %>%
+  fp_set_style(box = c("#F8766D", "#00BFC4"),
+               line = c("#F8766D", "#00BFC4"))  %>%
+  fp_set_zebra_style("#EFEFEF")
+
+
+png(str_glue("{fig_path}/forest.sex.d.png"), width = 1000, height = 600)
+  forest
+dev.off()
+
+pdf(str_glue("{fig_path}/forest.sex.d.pdf"), width = 12.5, height = 7.5)
+  forest
+dev.off()
+
+
+```
+
+<img src="figs2/forest.sex.d.png"/>
+
+### Alzheimer
+
+```{r, message=F, results=F}
+
+ep = "ALZHEIMER"
+
+#Hack to deal with separate values
+tmp <- cx.table.l[[ep]] %>%
+  select(variable, Sex, est_ci, nN_exp) %>%
+  pivot_wider(names_from=Sex, values_from=c("est_ci", "nN_exp")) %>%
+  unite(est_ci, matches("est_ci"), sep="\n")  %>%
+  unite(nN_exp, matches("nN"), sep="\n")
+  
+cx.table <- cx.table.l[[ep]] %>%
+  select(outcome, variable, mean, lower, upper, pval, Sex) %>%
+  left_join(tmp, by="variable") 
+
+#Forestplot&Table
+font.s <- 1.3
+font.l <- 1.5
+lwd.bar <- 3
+
+forest <- cx.table %>%
+  group_by(Sex) %>%
+  forestplot(labeltext = c(variable, nN_exp, est_ci, pval),
+             legend_args = fpLegend(pos = list(x = .8, y = 0.79), 
+                                    gp = gpar(col = "#CCCCCC")),
+             fn.ci_norm = c(fpDrawCircleCI, fpDrawNormalCI),
+             #boxsize = .1, # We set the box size to better visualize the type
+             line.margin = .3, # We need to add this to avoid crowding
+             graph.pos=3,
+             xlog=T,
+             shapes_gp = fpShapesGp(default = gpar(lwd = lwd.bar)),
+             txt_gp = fpTxtGp(ticks = gpar(cex=font.s-.1), 
+                              label=list(gpar(cex=font.l), gpar(cex=font.s), gpar(cex=font.s), gpar(cex=font.l)),
+                              legend=gpar(cex=font.s), 
+                              summary = gpar(cex=font.l))
+             ) %>%
+  fp_add_header(variable= " Variable\n", nN_exp="Exposed\nn/N", est_ci = "HR (95% CI)\n", pval = "Interaction\nP-value") %>%
+  fp_set_style(box = c("#F8766D", "#00BFC4"),
+               line = c("#F8766D", "#00BFC4"))  %>%
+  fp_set_zebra_style("#EFEFEF")
+
+
+png(str_glue("{fig_path}/forest.sex.a.png"), width = 1000, height = 600)
+  forest
+dev.off()
+
+pdf(str_glue("{fig_path}/forest.sex.a.pdf"), width = 12.5, height = 7.5)
+  forest
+dev.off()
+
+
+```
+
+<img src="figs2/forest.sex.a.png"/>
+
+### Vascular dementia
+
+```{r, message=F, results=F}
+
+ep = "VASCDEM"
+
+#Hack to deal with separate values
+tmp <- cx.table.l[[ep]] %>%
+  select(variable, Sex, est_ci, nN_exp) %>%
+  pivot_wider(names_from=Sex, values_from=c("est_ci", "nN_exp")) %>%
+  unite(est_ci, matches("est_ci"), sep="\n")  %>%
+  unite(nN_exp, matches("nN"), sep="\n")
+  
+cx.table <- cx.table.l[[ep]] %>%
+  select(outcome, variable, mean, lower, upper, pval, Sex) %>%
+  left_join(tmp, by="variable") 
+
+#Forestplot&Table
+font.s <- 1.3
+font.l <- 1.5
+lwd.bar <- 3
+
+forest <- cx.table %>%
+  group_by(Sex) %>%
+  forestplot(labeltext = c(variable, nN_exp, est_ci, pval),
+             legend_args = fpLegend(pos = list(x = .8, y = 0.79), 
+                                    gp = gpar(col = "#CCCCCC")),
+             fn.ci_norm = c(fpDrawCircleCI, fpDrawNormalCI),
+             #boxsize = .1, # We set the box size to better visualize the type
+             line.margin = .3, # We need to add this to avoid crowding
+             graph.pos=3,
+             xlog=T,
+             shapes_gp = fpShapesGp(default = gpar(lwd = lwd.bar)),
+             txt_gp = fpTxtGp(ticks = gpar(cex=font.s-.1), 
+                              label=list(gpar(cex=font.l), gpar(cex=font.s), gpar(cex=font.s), gpar(cex=font.l)),
+                              legend=gpar(cex=font.s), 
+                              summary = gpar(cex=font.l))
+             ) %>%
+  fp_add_header(variable= " Variable\n", nN_exp="Exposed\nn/N", est_ci = "HR (95% CI)\n", pval = "Interaction\nP-value") %>%
+  fp_set_style(box = c("#F8766D", "#00BFC4"),
+               line = c("#F8766D", "#00BFC4"))  %>%
+  fp_set_zebra_style("#EFEFEF")
+
+
+png(str_glue("{fig_path}/forest.sex.v.png"), width = 1000, height = 600)
+  forest
+dev.off()
+
+pdf(str_glue("{fig_path}/forest.sex.v.pdf"), width = 14, height = 8.4)
+  forest
+dev.off()
+
+
+```
+
+
+<img src="figs2/forest.sex.v.png"/>
+
+
+
+<details><summary>**Session info**</summary>
+
+```{r}
+sessionInfo()
+```
+
+</details>
+
+

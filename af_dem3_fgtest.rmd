@@ -1,0 +1,166 @@
+
+## Cox: Fine Gray
+
+Fine Gray model using death as competing risk
+
+**Create variables**
+  
+  ```{r}
+
+df.fg.tmp <- NULL
+df.tdc.fg <- NULL
+
+df.tdc.fg.l <- lapply(names_ep, as.null) %>% setNames(names_ep) 
+for(ep in unlist(names_ep)){
+  
+  #ep <- "DEMENTIA"
+  ep_age_tmp <- as.character(str_glue("{ep}_AGE"))
+  
+  df.fg.tmp <-   df %>%
+    mutate(EVENT_DEATH2 = if_else(get(ep) == 1, get(ep), as.integer(DEATH*2))) %>%
+    mutate(EVENT_DEATH2_AGE = if_else(get(ep) == 1, get(ep_age_tmp), DEATH_AGE)) %>%
+    mutate(EVENT_DEATH2 = as.factor(EVENT_DEATH2)) %>%
+    mutate(EVENT_DEATH2 = recode(EVENT_DEATH2, `0`="censor", `1`="event", `2`="death")) %>%  #select(EVENT_DEATH2) %>% summary()
+    as_tibble() 
+  
+  df.tdc.fg      <- tmerge(data1=df.fg.tmp, data2=df.fg.tmp, id=FINNGENID, tstart = START_AGE, tstop = EVENT_DEATH2_AGE)
+  
+  for(var in tdc_vars_ever){
+    #var %>% print()
+    df.tdc.fg  <- tmerge(data1=df.tdc.fg, data2=df.fg.tmp, id=FINNGENID, tdc_var = tdc(get(str_glue("{var}_AGE"))), 
+                         EVENT_DEATH2 = event(EVENT_DEATH2_AGE, EVENT_DEATH2)) %>%
+      rename(!!str_glue("{var}_TDC") := tdc_var)
+  }
+  
+  df.tdc.fg.l[[ep]] <- df.tdc.fg %>%
+    filter(tstop > tstart+0.003) %>%  #0.003 years = one day; coxph would inteprete very short time difference 0 time followup
+    mutate(time_test = tstop - tstart)
+  
+}
+
+# Number of individuals in each class
+lapply(names_ep, function(ep){table(df.tdc.fg.l[[ep]]$EVENT_DEATH2)}) %>% setNames(names_ep) 
+
+```
+
+**Models**
+  
+  Surv(fgstart, fgstop, fgstatus) ~ {var} + WOMEN + BIRTH_YEAR + SMOKED + OBESITY_TDC + HYPLIP_WIDE_TDC + CHRONKIDNEYDIS_TDC + HYPERTENSION_TDC + DIABETES_TDC + AUD_TDC
+
+```{r}
+
+
+nicenames <- c(DEMENTIA = " Any dementia", ALZHEIMER = " Alzheimer disase", VASCDEM = " Vascular dementia", 
+               AF_TDC = " Atrial fibrillation", OBESITY_TDC = " Obesity", 
+               HYPLIP_WIDE_TDC = " Hyperlipidemia", HEARTFAIL_ALLCAUSE_TDC=" Heart failure", 
+               MI_TDC = " Myocardial infarction", CHRONKIDNEYDIS_TDC = " Chronic kidney disease", 
+               HYPERTENSION_TDC = " Hypertension", DIABETES_TDC = " Diabetes", STR_TDC = " Stroke",
+               STR_EMBOLIC_TDC = " Embolic stroke", TIA_TDC = " TIA", 
+               AUD_TDC = " Alcohol abuse", PAD_TDC = " PAD")
+
+#Initialize
+ep <-  "DEMENTIA"
+cx.table.fg.l <- lapply(names_ep, function(x){NULL}) %>% setNames(unlist(names_ep))
+#cx.table.fg.l.d  <- lapply(names_ep, function(x){NULL}) %>% setNames(unlist(names_ep))
+cx.full.fg.l  <- lapply(names_ep, function(x){NULL}) %>% setNames(unlist(names_ep))
+
+#For each outcome...
+for(ep in unlist(names_ep)){
+  
+  #Covariate vector to formula format  
+  oth_covs2_f <- paste(c(oth_covs2), collapse = " + ")
+  #print(ep)
+  
+  fg.event.tdc <- finegray(Surv(tstart, tstop, EVENT_DEATH2) ~ ., data=df.tdc.fg.l[[ep]], etype="event", id=id)
+  #fg.death.tdc <- finegray(Surv(tstart, tstop, EVENT_DEATH2) ~ ., data=df.tdc.fg.l[[ep]], etype="death",  id=id)
+  
+  #Models/dementia
+  cx.l.tdc.fg<-
+    lapply(as.list(tdc_vars2), function(var){
+      
+      my_formula <- str_glue("Surv(fgstart, fgstop, fgstatus) ~ {var} + {oth_covs2_f}")
+      coxph(as.formula(my_formula), data=fg.event.tdc)
+      
+    }) %>% setNames(tdc_vars2)
+  cx.full.fg.l[[ep]] <- cx.l.tdc.fg
+  
+  #Number of exposed
+  nN <- fg.event.tdc %>%
+    extract_nN_tdc(ep, tdc_vars2) 
+  
+  #Table
+  cx.table.fg.l[[ep]]<- lapply(tdc_vars2, function(var){
+    coefs <- cx.l.tdc.fg[[var]] %>% 
+      my_extr_coef(ep, var)
+  }) %>% setNames(tdc_vars2) %>%
+    reduce(bind_rows) %>% 
+    mutate(p.adj = p.adjust(pval, method = "fdr", n = length(names_ep)*length(tdc_vars2))) %>%
+    left_join(nN, by="names") %>%
+    select(name, names, est, lower, upper, pval, p.adj, nN_exp, nN_nexp) %>%
+    my_tidy_est2() %>%
+    rename(outcome=name, variable=names, mean=est, FDR=p.adj) %>%
+    mutate(variable=nicenames[variable]) 
+}
+```
+
+**Forest plots**
+  
+  ```{r, fig.width=12, fig.height=8, message=F, results=F}
+
+
+#Stupid hack: forestplot, when grouped, allows only text lines for groups.
+#Thus lines within group needs to be combined to same cell and divided by "\n"
+tmp <- cx.table.fg.l %>%
+  reduce(bind_rows) %>%
+  select(variable, outcome, nN_exp, FDR, est_ci) %>%
+  pivot_wider(names_from=outcome, values_from=c("est_ci", "FDR", "nN_exp")) %>%
+  unite(est_ci, matches("est_ci"), sep="\n") %>%
+  unite(FDR, matches("FDR"), sep="\n") %>%
+  unite(nN_exp, matches("nN"), sep="\n")
+
+cx.table.fg <-cx.table.fg.l %>%
+  reduce(bind_rows) %>%
+  select(outcome, variable, mean, lower, upper) %>%
+  left_join(tmp, by="variable")
+
+#Forestplot&Table
+font.s <- 1.3
+font.l <- 1.5
+lwd.bar <- 3
+
+forest.fg <- cx.table.fg %>%
+  group_by(outcome) %>%
+  forestplot(labeltext = c(variable, nN_exp, est_ci, FDR),
+             legend = c("Any dementia", "Alzheimer's disease", "Vascular dementia"),
+             legend_args = fpLegend(pos = list(x = .8, y = 0.79), 
+                                    gp = gpar(col = "#CCCCCC")),
+             fn.ci_norm = c(fpDrawNormalCI, fpDrawDiamondCI, fpDrawCircleCI),
+             #boxsize = .1, # We set the box size to better visualize the type
+             line.margin = .25, # We need to add this to avoid crowding
+             graph.pos=3,
+             xlog=T,
+             shapes_gp = fpShapesGp(default = gpar(lwd = lwd.bar)),
+             txt_gp = fpTxtGp(ticks = gpar(cex=font.s-.1), 
+                              label=list(gpar(cex=font.l), gpar(cex=font.s), gpar(cex=font.s), gpar(cex=font.s)),
+                              legend=gpar(cex=font.s), 
+                              summary = gpar(cex=font.l))
+  ) %>%
+  fp_add_header(variable= " Variable\n", nN_exp="Exposed\nn/N", est_ci = "HR (95% CI)\n", FDR = "FDR\n") %>%
+  fp_set_style(box = c("#00BA38", "#619CFF", "#F8766D"),
+               line = c("#00BA38", "#619CFF", "#F8766D"))  %>%
+  fp_set_zebra_style("#EFEFEF")
+
+png(str_glue("{fig_path}/forest.fg.png"), width = 1050, height = 700)
+forest.fg
+dev.off()
+
+pdf(str_glue("{fig_path}/forest.fg.pdf"), width = 14.7, height = 9.8)
+forest.fg
+dev.off()
+
+
+```
+
+<img src="figs2/forest.fg.png"/>
+  
+  
